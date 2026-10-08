@@ -4636,7 +4636,7 @@ fn build_inner(
     )?;
     let native_toolchain = supplied_rust
         .as_ref()
-        .map(|rust| NativeToolchain::resolve(rust, native_environment.clone()))
+        .map(|rust| NativeToolchain::resolve(&store, rust, native_environment.clone()))
         .transpose()?;
     let zig_target = requested_target
         .as_deref()
@@ -5913,7 +5913,6 @@ fn plan_source_replacements(index: usize, root: &Path) -> [(String, String); 2] 
 }
 
 fn plan_local_sources(meta: &Metadata, ws_root: &Path) -> Result<Vec<(PlanLocalSource, PathBuf)>> {
-    let mut repositories = HashMap::new();
     let mut roots: BTreeMap<PathBuf, String> = BTreeMap::new();
     for package in &meta.packages {
         if package.source.is_some() {
@@ -5925,20 +5924,19 @@ fn plan_local_sources(meta: &Metadata, ws_root: &Path) -> Result<Vec<(PlanLocalS
                 package.root().display()
             )
         })?;
-        let (root, identity) = if let Some((repository_root, remote)) =
-            git_repository(&package_root, &mut repositories)
-        {
-            (repository_root.clone(), format!("git+{remote}"))
-        } else {
-            let root = if package_root.starts_with(ws_root) {
-                ws_root.to_path_buf()
+        let (root, identity) =
+            if let Some((repository_root, remote)) = git_repository(&package_root) {
+                (repository_root, format!("git+{remote}"))
             } else {
-                package_root
+                let root = if package_root.starts_with(ws_root) {
+                    ws_root.to_path_buf()
+                } else {
+                    package_root
+                };
+                let manifest = fs::read(root.join("Cargo.toml"))
+                    .with_context(|| format!("reading {}/Cargo.toml", root.display()))?;
+                (root, format!("manifest+{}", sha256_hex(&manifest)))
             };
-            let manifest = fs::read(root.join("Cargo.toml"))
-                .with_context(|| format!("reading {}/Cargo.toml", root.display()))?;
-            (root, format!("manifest+{}", sha256_hex(&manifest)))
-        };
         if let Some(previous) = roots.insert(root.clone(), identity.clone()) {
             if previous != identity {
                 bail!(
@@ -5994,8 +5992,7 @@ fn resolve_plan_sources(ws_root: &Path, sources: &[PlanLocalSource]) -> Option<V
 }
 
 fn plan_source_identity(root: &Path) -> Option<String> {
-    let mut repositories = HashMap::new();
-    if let Some((repository_root, remote)) = git_repository(root, &mut repositories) {
+    if let Some((repository_root, remote)) = git_repository(root) {
         if repository_root == root {
             return Some(format!("git+{remote}"));
         }
@@ -8634,7 +8631,6 @@ fn run_rustc_streaming(
 /// with their absolute directory, which prevents the same crate from sharing
 /// artifacts when reached from another workspace or checkout.
 fn logical_package_ids(metadata: &Metadata) -> Result<Vec<String>> {
-    let mut repositories: HashMap<PathBuf, Option<(PathBuf, String)>> = HashMap::new();
     metadata
         .packages
         .iter()
@@ -8642,7 +8638,7 @@ fn logical_package_ids(metadata: &Metadata) -> Result<Vec<String>> {
             if package.source.is_some() {
                 return Ok(package.id.clone());
             }
-            if let Some((repository, manifest)) = git_package_identity(package, &mut repositories) {
+            if let Some((repository, manifest)) = git_package_identity(package) {
                 return Ok(format!(
                     "git+{repository}#{manifest}#{}@{}",
                     package.name, package.version
@@ -8660,29 +8656,29 @@ fn logical_package_ids(metadata: &Metadata) -> Result<Vec<String>> {
         .collect()
 }
 
-fn git_package_identity(
-    package: &Package,
-    repositories: &mut HashMap<PathBuf, Option<(PathBuf, String)>>,
-) -> Option<(String, String)> {
-    let package_root = package.root();
-    let (repository_root, remote) = git_repository(&package_root, repositories)?;
+fn git_package_identity(package: &Package) -> Option<(String, String)> {
+    let (repository_root, remote) = git_repository(&package.root())?;
     let manifest = Path::new(&package.manifest_path)
         .strip_prefix(repository_root)
         .ok()?
         .to_slash_lossy()
         .into_owned();
-    Some((remote.clone(), manifest))
+    Some((remote, manifest))
 }
 
-fn git_repository<'a>(
-    package_root: &Path,
-    repositories: &'a mut HashMap<PathBuf, Option<(PathBuf, String)>>,
-) -> Option<&'a (PathBuf, String)> {
+/// The repository root and normalized origin remote containing `package_root`.
+/// Answers are cached for the whole process: each lookup starts two git
+/// processes, which costs tens of milliseconds on Windows.
+fn git_repository(package_root: &Path) -> Option<(PathBuf, String)> {
+    static REPOSITORIES: Mutex<BTreeMap<PathBuf, Option<(PathBuf, String)>>> =
+        Mutex::new(BTreeMap::new());
     let repository_hint = package_root
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())?
         .to_path_buf();
-    repositories
+    REPOSITORIES
+        .lock()
+        .unwrap()
         .entry(repository_hint.clone())
         .or_insert_with(|| {
             let repository_root = command_stdout(Command::new("git").args([
@@ -8703,7 +8699,7 @@ fn git_repository<'a>(
             .and_then(|remote| normalize_git_remote(&remote))?;
             Some((repository_root, remote))
         })
-        .as_ref()
+        .clone()
 }
 
 fn command_stdout(command: &mut Command) -> Option<String> {
