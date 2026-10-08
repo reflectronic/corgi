@@ -538,22 +538,52 @@ pub struct Ctx {
     report: Arc<crate::report::Recorder>,
 }
 
+/// The C toolchain actions use. Ask it what an action needs rather than
+/// matching on where it came from.
 enum ResolvedToolchain {
-    Supplied(NativeToolchain),
+    /// One toolchain selected before planning (`NativeToolchain::select`).
+    Native(NativeToolchain),
+    /// Corgi's pinned macOS toolchain, with a runtime per Apple platform.
     ManagedDarwin(ManagedDarwinToolchain),
 }
 
 impl ResolvedToolchain {
-    fn supplied(&self) -> Option<&NativeToolchain> {
+    fn native(&self) -> Option<&NativeToolchain> {
         match self {
-            Self::Supplied(native) => Some(native),
+            Self::Native(native) => Some(native),
             Self::ManagedDarwin(_) => None,
+        }
+    }
+
+    /// A command for `program` (rustc, clippy) in this toolchain's environment.
+    fn command(&self, program: &Path) -> Command {
+        crate::native_toolchain::tool_command(self.native(), program)
+    }
+
+    /// Read-only paths compile actions need beyond the store and sysroot.
+    fn read_paths(&self) -> &[PathBuf] {
+        self.native()
+            .map_or(&[], |native| native.runtime_paths.as_slice())
+    }
+
+    /// The linker for every platform, when the toolchain fixes one. Managed
+    /// macOS links through each platform's runtime (`darwin_runtime`).
+    fn linker(&self) -> Option<&Path> {
+        self.native().map(|native| native.compiler.as_path())
+    }
+
+    /// What build scripts for `platform` need to find the C tools. A native
+    /// toolchain's environment already reaches every action.
+    fn build_script_environment(&self, platform: &str, host: &str) -> Vec<(String, String)> {
+        match self {
+            Self::Native(_) => Vec::new(),
+            Self::ManagedDarwin(managed) => managed.build_script_environment(platform, host),
         }
     }
 
     fn darwin_runtime(&self, platform: &str) -> Option<&MacosRuntime> {
         match self {
-            Self::Supplied(_) => None,
+            Self::Native(_) => None,
             Self::ManagedDarwin(managed) => managed
                 .runtimes
                 .iter()
@@ -567,7 +597,7 @@ impl ResolvedToolchain {
         zig_identity: &str,
     ) -> Result<(String, crate::report::ToolchainInput)> {
         let ((cc, ld, sdk), macos_identity, libclang_identity) = match self {
-            Self::Supplied(native) => (
+            Self::Native(native) => (
                 (
                     native.compiler_version.trim().to_string(),
                     format!("{} (native Clang link driver)", native.compiler.display()),
@@ -4634,10 +4664,12 @@ fn build_inner(
         build_std,
         &cargo_config.env,
     )?;
-    let native_toolchain = supplied_rust
-        .as_ref()
-        .map(|rust| NativeToolchain::resolve(&store, rust, native_environment.clone()))
-        .transpose()?;
+    let native_toolchain = NativeToolchain::select(
+        &store,
+        supplied_rust
+            .as_ref()
+            .map(|rust| (rust, native_environment.clone())),
+    )?;
     let zig_target = requested_target
         .as_deref()
         .map(|target| {
@@ -4721,11 +4753,8 @@ fn build_inner(
     });
     // Build scripts learn the compilation cfg through CARGO_CFG_*; cargo
     // probes rustc with the applicable rustflags so --cfg flags show up.
-    let mut cfg_probe = if let Some(native) = &native_toolchain {
-        crate::native_toolchain::controlled_command(Path::new(&rustc), &native.environment)
-    } else {
-        Command::new(&rustc)
-    };
+    let mut cfg_probe =
+        crate::native_toolchain::tool_command(native_toolchain.as_ref(), Path::new(&rustc));
     cfg_probe.args(["--print", "cfg"]);
     cfg_probe.args(&host_rustflags);
     let cfg_out = capture(&mut cfg_probe, "rustc --print cfg")?;
@@ -4763,11 +4792,8 @@ fn build_inner(
         }
     }
     let cfg_env_target = if let Some(t) = &target {
-        let mut probe = if let Some(native) = &native_toolchain {
-            crate::native_toolchain::controlled_command(Path::new(&rustc), &native.environment)
-        } else {
-            Command::new(&rustc)
-        };
+        let mut probe =
+            crate::native_toolchain::tool_command(native_toolchain.as_ref(), Path::new(&rustc));
         probe.args(["--print", "cfg", "--target", t]);
         probe.args(&target_rustflags);
         let o = capture(&mut probe, "rustc --print cfg --target")?;
@@ -5247,7 +5273,7 @@ fn build_inner(
     report_stage_start = begin_report_stage(&recorder, "prepare");
 
     let toolchain = match native_toolchain {
-        Some(native) => ResolvedToolchain::Supplied(native),
+        Some(native) => ResolvedToolchain::Native(native),
         None => match host_platform {
             HostPlatform::Darwin => {
                 let runtimes = setup_darwin_runtimes(
@@ -5297,14 +5323,7 @@ fn build_inner(
             .join(executable_name("clippy-driver"))
             .display()
             .to_string();
-        let mut probe = if let Some(native) = toolchain.supplied() {
-            crate::native_toolchain::controlled_command(
-                Path::new(&clippy_driver),
-                &native.environment,
-            )
-        } else {
-            Command::new(&clippy_driver)
-        };
+        let mut probe = toolchain.command(Path::new(&clippy_driver));
         let version = capture(probe.arg("-V"), "clippy-driver -V")?;
         let mut conf_hash = String::new();
         for name in ["clippy.toml", ".clippy.toml"] {
@@ -8510,14 +8529,7 @@ fn expected_outputs(
             let p = match from_store {
                 Some(p) => p,
                 None => {
-                    let mut cmd = if let Some(native) = ctx.toolchain.supplied() {
-                        crate::native_toolchain::controlled_command(
-                            Path::new(&ctx.rustc),
-                            &native.environment,
-                        )
-                    } else {
-                        Command::new(&ctx.rustc)
-                    };
+                    let mut cmd = ctx.toolchain.command(Path::new(&ctx.rustc));
                     cmd.args([
                         "--print",
                         "file-names",
@@ -9272,9 +9284,7 @@ fn compile(
     let package_inputs = ctx.package_read_inputs(unit.pkg, PackageReadPhase::Compile)?;
     let mut allowed_inputs: Vec<PathBuf> =
         vec![ctx.store.root.clone(), PathBuf::from(&ctx.sysroot)];
-    if let Some(native) = ctx.toolchain.supplied() {
-        allowed_inputs.extend(native.runtime_paths.iter().cloned());
-    }
+    allowed_inputs.extend(ctx.toolchain.read_paths().iter().cloned());
     if clippy_action {
         if let Some(conf) = &ctx.clippy_conf {
             allowed_inputs.push(conf.clone());
@@ -9385,9 +9395,8 @@ fn compile(
     for f in pflags {
         cmd.arg(f);
     }
-    if let Some(native) = ctx.toolchain.supplied() {
-        cmd.arg("-C")
-            .arg(format!("linker={}", native.compiler.display()));
+    if let Some(linker) = ctx.toolchain.linker() {
+        cmd.arg("-C").arg(format!("linker={}", linker.display()));
     }
     for f in lint_flags {
         cmd.arg(f);
@@ -9670,9 +9679,7 @@ fn build_script_environment<'a>(
     env.push(("RUSTC".into(), ctx.rustc.clone()));
     env.push(("RUSTDOC".into(), "rustdoc".into()));
     env.push(("CARGO".into(), ctx.cargo.clone()));
-    if let ResolvedToolchain::ManagedDarwin(managed) = &ctx.toolchain {
-        env.extend(managed.build_script_environment(&platform, &ctx.host));
-    }
+    env.extend(ctx.toolchain.build_script_environment(&platform, &ctx.host));
     if platform != ctx.host {
         if let (Some(zig), Some(target)) = (&ctx.zig, &ctx.target) {
             let target_environment = target.replace('-', "_");
@@ -10199,7 +10206,8 @@ mod build_platform_tests {
         configure_darwin_link_output, is_apple_target, HostPlatform, MacosRuntime,
         ManagedDarwinToolchain, NativeToolchain, ResolvedToolchain, ToolchainSource,
     };
-    use std::{path::Path, process::Command};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn apple_output_classification_includes_non_darwin_targets() {
@@ -10307,7 +10315,8 @@ mod build_platform_tests {
             .iter()
             .any(|(name, _)| matches!(name.as_str(), "CC" | "SDKROOT" | "PATH")));
         let toolchain = ResolvedToolchain::ManagedDarwin(managed);
-        assert!(toolchain.supplied().is_none());
+        assert!(toolchain.linker().is_none());
+        assert!(toolchain.read_paths().is_empty());
         assert_eq!(
             toolchain.darwin_runtime(target).unwrap().directory,
             Path::new("/target")
@@ -10341,14 +10350,20 @@ mod build_platform_tests {
 
     #[test]
     fn supplied_toolchains_have_no_managed_darwin_inputs() {
-        let toolchain = ResolvedToolchain::Supplied(NativeToolchain {
+        let toolchain = ResolvedToolchain::Native(NativeToolchain {
             compiler: "/nix/store/clang/bin/clang".into(),
             compiler_version: "clang version 21\n".into(),
             environment: Vec::new(),
             identity: "closure-hash".into(),
-            runtime_paths: Vec::new(),
+            runtime_paths: vec!["/nix/store/clang".into()],
         });
-        assert!(toolchain.supplied().is_some());
+        assert_eq!(
+            toolchain.linker(),
+            Some(Path::new("/nix/store/clang/bin/clang"))
+        );
+        assert_eq!(toolchain.read_paths(), [PathBuf::from("/nix/store/clang")]);
+        let host = "aarch64-apple-darwin";
+        assert!(toolchain.build_script_environment(host, host).is_empty());
         assert!(toolchain.darwin_runtime("aarch64-apple-darwin").is_none());
         let (identity, report) = toolchain.identity("1.97.1", "").unwrap();
         assert_eq!(

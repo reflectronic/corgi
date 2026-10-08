@@ -1,4 +1,8 @@
-//! Supplied native toolchains and their runtime dependencies.
+//! Native C toolchains known before planning, and their runtime dependencies.
+//!
+//! [`NativeToolchain::select`] decides where one comes from. Today that is a
+//! supplied Clang (`CORGI_CC`) checked against the supplied Rust; Corgi's
+//! managed macOS toolchain is set up later by the build, not here.
 //!
 //! Tool paths, content-hashed dependencies, and explicitly supported wrapper
 //! environment are inputs to the build, not ambient executable search state.
@@ -141,7 +145,20 @@ impl ToolchainSource {
 }
 
 impl NativeToolchain {
-    pub fn resolve(
+    /// The native toolchain for this build, or `None` when Corgi's managed
+    /// toolchain is set up later. `supplied` is the supplied Rust and the
+    /// wrapper environment captured for it.
+    pub fn select(
+        store: &crate::store::Store,
+        supplied: Option<(&SuppliedRust, Vec<(String, String)>)>,
+    ) -> Result<Option<Self>> {
+        supplied
+            .map(|(rust, environment)| Self::supplied_clang(store, rust, environment))
+            .transpose()
+    }
+
+    /// The Clang named by `CORGI_CC`, validated against the supplied Rust.
+    fn supplied_clang(
         store: &crate::store::Store,
         rust: &SuppliedRust,
         environment: Vec<(String, String)>,
@@ -273,6 +290,15 @@ pub fn wrapper_environment(configured: &[(String, String)]) -> Result<Vec<(Strin
         }
     }
     Ok(environment.into_iter().collect())
+}
+
+/// `program` under `native`'s controlled environment; with no native
+/// toolchain, under Corgi's own environment.
+pub fn tool_command(native: Option<&NativeToolchain>, program: &Path) -> Command {
+    match native {
+        Some(native) => controlled_command(program, &native.environment),
+        None => Command::new(program),
+    }
 }
 
 pub fn controlled_command(program: &Path, environment: &[(String, String)]) -> Command {
