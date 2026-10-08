@@ -5,8 +5,8 @@
 //! carry a Windows file ID from a directory listing, and only `std` can
 //! construct it, so this module returns its own [`Stat`].
 //!
-//! Platform code lives in `file_stat/unix.rs`; everything else uses only the
-//! functions below.
+//! Platform code lives in `file_stat/unix.rs` and `file_stat/windows.rs`;
+//! everything else uses only the functions below.
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -14,7 +14,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-#[path = "file_stat/unix.rs"]
+#[cfg_attr(unix, path = "file_stat/unix.rs")]
+#[cfg_attr(windows, path = "file_stat/windows.rs")]
 mod sys;
 
 /// Identifies one version of one file. Equal keys mean the content is

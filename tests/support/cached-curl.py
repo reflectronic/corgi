@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Cache successful test downloads until target/curl-cache is cleared."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +9,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+try:
+    import fcntl
+
+    def lock_exclusive(file):
+        fcntl.flock(file, fcntl.LOCK_EX)
+except ImportError:  # Windows
+    import msvcrt
+
+    def lock_exclusive(file):
+        # LK_LOCK gives up after ten one-second retries; downloads take longer.
+        while True:
+            try:
+                msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                pass
 
 
 def cache_request(arguments):
@@ -55,7 +71,7 @@ def main(arguments):
     artifact = cache / key
     # Lock files persist: unlinking them can create multiple locks for one key.
     with open(cache / (key + ".lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_exclusive(lock)
         if not artifact.is_file():
             descriptor, temporary = tempfile.mkstemp(prefix=key + ".", suffix=".tmp", dir=cache)
             os.close(descriptor)

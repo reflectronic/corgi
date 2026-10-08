@@ -2,8 +2,12 @@ use crate::meta::{self, Metadata, Package, Target};
 use crate::native_toolchain::{NativeToolchain, SuppliedRust, ToolchainSource};
 use crate::platform::executable_name;
 use crate::report::UnitKeyResolution as KeyResolution;
+#[cfg(unix)]
 use crate::sandbox::linux::setup_linux_sandbox;
+#[cfg(unix)]
 use crate::sandbox::macos::{check_macos_sandbox, setup_macos_sandbox};
+#[cfg(windows)]
+use crate::sandbox::windows::{check_windows_sandbox, setup_windows_sandbox};
 use crate::sandbox::Sandbox;
 use crate::store::{sha256_hex, Store};
 use anyhow::{bail, Context, Result};
@@ -237,6 +241,12 @@ fn unit_links(unit: &Unit) -> bool {
 /// by path, in its debug map.
 fn is_debug_object(name: &str) -> bool {
     name.ends_with(".o")
+}
+
+/// Windows debug information. The image records only this file name, and
+/// debuggers look for it beside the image.
+fn is_pdb(name: &str) -> bool {
+    name.ends_with(".pdb")
 }
 
 /// Under `check`, units outside every execution closure (build scripts,
@@ -541,6 +551,8 @@ pub struct Ctx {
 /// The C toolchain actions use. Corgi gets one in one of these ways:
 /// - supplied: the Clang named by `CORGI_CC`, one compiler for every
 ///   platform (`Native`);
+/// - discovered on Windows: the installed MSVC and Windows SDK, which may
+///   not be redistributed, also one for every platform (`Native`);
 /// - downloaded for macOS: Corgi's pinned Clang, Apple SDK and LLD, set up
 ///   per Apple platform (`ManagedDarwin`).
 ///
@@ -577,7 +589,7 @@ impl ResolvedToolchain {
     /// The linker for every platform, when the toolchain fixes one. Managed
     /// macOS links through each platform's runtime (`darwin_runtime`).
     fn linker(&self) -> Option<&Path> {
-        self.native().map(|native| native.compiler.as_path())
+        self.native().map(|native| native.linker.as_path())
     }
 
     /// What build scripts for `platform` need to find the C tools. A native
@@ -608,7 +620,11 @@ impl ResolvedToolchain {
             Self::Native(native) => (
                 (
                     native.compiler_version.trim().to_string(),
-                    format!("{} (native Clang link driver)", native.compiler.display()),
+                    if native.compiler == native.linker {
+                        format!("{} (native Clang link driver)", native.linker.display())
+                    } else {
+                        format!("{} (native link driver)", native.linker.display())
+                    },
                     format!("supplied toolchain inputs {}", native.identity),
                 ),
                 String::new(),
@@ -1710,7 +1726,7 @@ fn compute_action_plans(ctx: &Ctx) -> Result<Vec<ActionPlan>> {
             {
                 environment.push((
                     "CARGO_TARGET_TMPDIR".to_string(),
-                    "/tmp/corgi/target-tmp".to_string(),
+                    cargo_target_tmpdir(&ctx.store).display().to_string(),
                 ));
             }
             environment.sort();
@@ -3083,6 +3099,7 @@ fn parse_github_release_url(url: &str) -> Result<(String, String, String)> {
 enum HostPlatform {
     Linux,
     Darwin,
+    Windows,
 }
 
 impl HostPlatform {
@@ -3094,7 +3111,8 @@ impl HostPlatform {
         match os {
             "linux" => Ok(Self::Linux),
             "macos" => Ok(Self::Darwin),
-            _ => bail!("unsupported host OS {os}; corgi builds require macOS or Linux"),
+            "windows" => Ok(Self::Windows),
+            _ => bail!("unsupported host OS {os}; corgi builds require macOS, Linux, or Windows"),
         }
     }
 
@@ -3104,13 +3122,18 @@ impl HostPlatform {
         let os = match self {
             Self::Linux => "unknown-linux-gnu", // TODO: musl detection
             Self::Darwin => "apple-darwin",
+            Self::Windows => "pc-windows-msvc",
         };
         format!("{arch}-{os}")
     }
 
     fn validate_toolchain_source(self, source: ToolchainSource) -> Result<()> {
         match (self, source) {
-            (_, ToolchainSource::Supplied) | (Self::Darwin, ToolchainSource::Managed) => Ok(()),
+            (Self::Windows, ToolchainSource::Supplied) => {
+                bail!("supplied toolchains are not supported on Windows; Corgi uses its pinned Rust with the installed MSVC")
+            }
+            (_, ToolchainSource::Supplied)
+            | (Self::Darwin | Self::Windows, ToolchainSource::Managed) => Ok(()),
             (Self::Linux, ToolchainSource::Managed) => {
                 bail!("managed Linux toolchains are not implemented; set CORGI_RUST_TOOLCHAIN and CORGI_CC")
             }
@@ -3544,7 +3567,7 @@ fn touch_git_database(cargo_home: &Path, package_root: &Path) {
 }
 
 /// Refresh a tool/toolchain dir's use marker (throttled like all touches).
-fn touch_tool_marker(dir: &Path) {
+pub(crate) fn touch_tool_marker(dir: &Path) {
     let marker = dir.join(".corgi-used");
     if !marker.exists() {
         let _ = fs::write(&marker, b"used\n");
@@ -3582,6 +3605,11 @@ fn select_toolchain(
     // project asks the selected toolchain for its channel.
     let source = ToolchainSource::for_build()?;
     host_platform.validate_toolchain_source(source)?;
+    if host_platform == HostPlatform::Windows
+        && (target.is_some_and(|target| target != host) || build_std)
+    {
+        bail!("Windows builds support only the host target, without build-std");
+    }
     let channel = read_toolchain_pin(dir)?;
     if source == ToolchainSource::Managed {
         return Ok(SelectedToolchain {
@@ -4005,8 +4033,12 @@ fn ensure_rustfmt(store: &Store, channel: &str, triple: &str) -> Result<PathBuf>
 
 /// rustfmt links against rustc_driver with an @rpath/../lib lookup. Keep the
 /// component separate while exposing the matching pinned compiler libraries
-/// at the relative location rustfmt expects.
+/// at the relative location rustfmt expects. Windows finds rustc_driver's DLL
+/// through PATH instead, which `fmt` sets to the compiler's bin directory.
 fn ensure_rustfmt_lib_link(dir: &Path, channel: &str, triple: &str) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
     let link = dir.join("lib");
     if fs::symlink_metadata(&link).is_ok() {
         return Ok(());
@@ -4506,8 +4538,15 @@ fn store_cargo_home(store: &Store) -> PathBuf {
 
 pub fn build(store: Store, dir: &Path, mut opts: BuildOpts) -> Result<()> {
     let host_platform = HostPlatform::current()?;
+    #[cfg(unix)]
     if host_platform == HostPlatform::Darwin {
         check_macos_sandbox()?;
+    }
+    #[cfg(windows)]
+    {
+        check_windows_sandbox()?;
+        // Before taking any lock or starting any action.
+        crate::sandbox::windows::kill_descendants_on_exit()?;
     }
     opts.packages.sort();
     opts.packages.dedup();
@@ -4599,6 +4638,7 @@ fn build_inner(
     host_platform: HostPlatform,
     recorder: Arc<crate::report::Recorder>,
 ) -> Result<()> {
+    #[cfg(unix)]
     raise_file_descriptor_limit()?;
     let BuildOpts {
         verbose,
@@ -4674,6 +4714,7 @@ fn build_inner(
     )?;
     let native_toolchain = NativeToolchain::select(
         &store,
+        &host_guess,
         supplied_rust
             .as_ref()
             .map(|rust| (rust, native_environment.clone())),
@@ -4815,8 +4856,16 @@ fn build_inner(
         .as_ref()
         .map(|native| native.runtime_paths.clone())
         .unwrap_or_default();
+    let jobserver = jobserver::Client::new(
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4),
+    )
+    .context("creating jobserver")?;
     let sandbox = match host_platform {
+        #[cfg(unix)]
         HostPlatform::Linux => Sandbox::Linux(setup_linux_sandbox(&store, runtime_paths)?),
+        #[cfg(unix)]
         HostPlatform::Darwin => Sandbox::Darwin(setup_macos_sandbox(
             &store,
             Path::new(&rustc),
@@ -4824,6 +4873,16 @@ fn build_inner(
             Path::new(&cargo_home),
             runtime_paths,
         )?),
+        #[cfg(windows)]
+        HostPlatform::Windows => Sandbox::Windows(setup_windows_sandbox(
+            &store,
+            Path::new(&rustc),
+            Path::new(&sysroot),
+            Path::new(&cargo_home),
+            runtime_paths,
+            crate::sandbox::windows::configure_jobserver(&jobserver)?,
+        )?),
+        _ => bail!("sandbox backend is unavailable for this host"),
     };
     if verbose {
         status!("Sandbox", "hermetic mode enabled ({})", sandbox.name());
@@ -5302,6 +5361,7 @@ fn build_inner(
                 })
             }
             HostPlatform::Linux => bail!("managed Linux toolchains are not implemented"),
+            HostPlatform::Windows => bail!("Windows native toolchain discovery did not complete"),
         },
     };
     let zig_runtime = zig_target
@@ -5534,12 +5594,7 @@ fn build_inner(
         zig: zig_runtime,
         timings,
         incremental: !no_incremental,
-        jobserver: jobserver::Client::new(
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4),
-        )
-        .context("creating jobserver")?,
+        jobserver,
         idents,
         action_plans: Vec::new(),
         logical_pkg_ids,
@@ -5578,7 +5633,8 @@ fn build_inner(
     let exports_harnesses = matches!(mode, Mode::Test | Mode::Bench)
         || (matches!(mode, Mode::Build) && targets.includes_harnesses());
     if exports_harnesses {
-        fs::create_dir_all("/tmp/corgi/target-tmp").context("creating CARGO_TARGET_TMPDIR")?;
+        fs::create_dir_all(cargo_target_tmpdir(&ctx.store))
+            .context("creating CARGO_TARGET_TMPDIR")?;
     }
 
     let mut written = Vec::new();
@@ -6601,7 +6657,7 @@ impl Ctx {
     /// dependency pool that rustc scans for linkable libraries.
     fn materialize_action(&self, index: usize, action_key: &str, res: &ActionResult) -> Result<()> {
         for o in &res.outputs {
-            if !is_debug_object(&o.name) {
+            if !is_debug_object(&o.name) && !is_pdb(&o.name) {
                 let pool_name = Store::pool_file_name(&o.name, action_key);
                 self.store.materialize_pool(&o.hash, &pool_name, o.exe)?;
             }
@@ -6655,6 +6711,10 @@ impl Ctx {
         let destination = self.target_dir.join(relative.strip_prefix("target")?);
         self.store
             .export_with_debug(&output.hash, &destination, true, &objects)?;
+        for pdb in res.outputs.iter().filter(|output| is_pdb(&output.name)) {
+            self.store
+                .export(&pdb.hash, &destination.with_file_name(&pdb.name), false)?;
+        }
         Ok(destination)
     }
 
@@ -9318,6 +9378,8 @@ fn compile(
     cmd.current_dir(compile_dir);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
+    #[cfg(windows)]
+    cmd.env("TEMP", &scratch).env("TMP", &scratch);
     if ctx.zig.is_some() {
         let zig_global_cache = scratch.join("zig-global-cache");
         let zig_local_cache = scratch.join("zig-local-cache");
@@ -9855,6 +9917,8 @@ fn run_build_script(
     cmd.current_dir(&pkg_root);
     cmd.env_clear();
     cmd.env("TMPDIR", &scratch);
+    #[cfg(windows)]
+    cmd.env("TEMP", &scratch).env("TMP", &scratch);
     if ctx.zig.is_some() {
         let zig_global_cache = scratch.join("zig-global-cache");
         let zig_local_cache = scratch.join("zig-local-cache");
@@ -10059,6 +10123,14 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn cargo_target_tmpdir(store: &Store) -> PathBuf {
+    if cfg!(windows) {
+        store.root.join("target-tmp")
+    } else {
+        PathBuf::from("/tmp/corgi/target-tmp")
+    }
+}
+
 #[cfg(test)]
 mod dep_info_tests {
     use super::dep_info_package_files;
@@ -10186,6 +10258,7 @@ mod dep_info_tests {
 }
 
 /// Parallel compiler processes need more descriptors than some shells allow by default.
+#[cfg(unix)]
 fn raise_file_descriptor_limit() -> Result<()> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -10276,7 +10349,10 @@ mod build_platform_tests {
             HostPlatform::from_os("macos").unwrap(),
             HostPlatform::Darwin
         );
-        assert!(HostPlatform::from_os("windows").is_err());
+        assert_eq!(
+            HostPlatform::from_os("windows").unwrap(),
+            HostPlatform::Windows
+        );
     }
 
     #[test]
@@ -10295,6 +10371,7 @@ mod build_platform_tests {
         assert!(error.to_string().contains("managed Linux toolchains"));
     }
 
+    #[cfg(unix)] // Asserts Unix path spellings.
     #[test]
     fn managed_darwin_environment_scopes_host_and_target_tools() {
         let host = "aarch64-apple-darwin";
@@ -10360,6 +10437,7 @@ mod build_platform_tests {
     fn supplied_toolchains_have_no_managed_darwin_inputs() {
         let toolchain = ResolvedToolchain::Native(NativeToolchain {
             compiler: "/nix/store/clang/bin/clang".into(),
+            linker: "/nix/store/clang/bin/clang".into(),
             compiler_version: "clang version 21\n".into(),
             environment: Vec::new(),
             identity: "closure-hash".into(),

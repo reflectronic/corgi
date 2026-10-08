@@ -442,6 +442,7 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)] // Asserts Unix path spellings.
     #[test]
     fn xcrun_never_falls_back_to_host_tools() {
         let config = config();

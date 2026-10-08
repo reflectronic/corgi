@@ -1,14 +1,21 @@
 //! Native C toolchains known before planning, and their runtime dependencies.
 //!
-//! [`NativeToolchain::select`] decides where one comes from. Today that is a
-//! supplied Clang (`CORGI_CC`) checked against the supplied Rust; Corgi's
-//! managed macOS toolchain is set up later by the build, not here.
+//! [`NativeToolchain::select`] decides where one comes from:
+//! - supplied: the Clang named by `CORGI_CC`, checked against the supplied Rust;
+//! - managed on Windows: the installed MSVC and Windows SDK (`msvc`);
+//! - managed on macOS: none here; the build sets up Corgi's pinned toolchain
+//!   after planning.
 //!
 //! Tool paths, content-hashed dependencies, and explicitly supported wrapper
 //! environment are inputs to the build, not ambient executable search state.
 //! Platform build integration selects a sandbox separately from the toolchain.
 
 mod inputs;
+#[cfg(windows)]
+mod msvc;
+
+#[cfg(windows)]
+pub use msvc::{is_link_invocation, run_link_invocation};
 
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -107,6 +114,8 @@ impl SuppliedRust {
 
 pub struct NativeToolchain {
     pub compiler: PathBuf,
+    /// What rustc runs to link: Clang itself, or Corgi's link.exe driver.
+    pub linker: PathBuf,
     pub compiler_version: String,
     pub environment: Vec<(String, String)>,
     pub identity: String,
@@ -150,11 +159,19 @@ impl NativeToolchain {
     /// wrapper environment captured for it.
     pub fn select(
         store: &crate::store::Store,
+        host: &str,
         supplied: Option<(&SuppliedRust, Vec<(String, String)>)>,
     ) -> Result<Option<Self>> {
-        supplied
-            .map(|(rust, environment)| Self::supplied_clang(store, rust, environment))
-            .transpose()
+        match supplied {
+            Some((rust, environment)) => Self::supplied_clang(store, rust, environment).map(Some),
+            #[cfg(windows)]
+            None => msvc::discover(host, store).map(Some),
+            #[cfg(not(windows))]
+            None => {
+                let _ = host;
+                Ok(None)
+            }
+        }
     }
 
     /// The Clang named by `CORGI_CC`, validated against the supplied Rust.
@@ -263,6 +280,7 @@ impl NativeToolchain {
             &environment,
         ))?);
         Ok(Self {
+            linker: compiler.clone(),
             compiler,
             compiler_version,
             environment,

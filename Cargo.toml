@@ -44,6 +44,20 @@ toml = "0.8"
 toml_edit = "0.22"
 zstd = { version = "0.13", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+find-msvc-tools = "0.1.14"
+flatbuffers = "25"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
 # Debug builds of Corgi hash gigabytes of toolchain and source files.
 [profile.dev.package.sha2]
 opt-level = 3

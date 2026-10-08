@@ -9,8 +9,10 @@ use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 pub(super) struct RuntimeInputs {
@@ -78,6 +80,7 @@ fn resolve_hinted(roots: &[PathBuf], hints: &mut HintCache) -> Result<RuntimeInp
         }
         processed.insert(path);
     }
+    #[cfg(unix)]
     if !state.nix_roots.is_empty() {
         let mut command = Command::new(super::find_executable("nix-store")?);
         command
@@ -148,7 +151,7 @@ impl Resolver<'_> {
             root.join(relative)
         };
         field(&mut self.hash, relative.as_os_str().as_encoded_bytes());
-        field(&mut self.hash, &stat.mode.to_le_bytes());
+        hash_mode(&mut self.hash, stat.mode);
         if stat.kind == Kind::Directory {
             field(&mut self.hash, b"directory");
             let entries = file_stat::read_dir(&path)
@@ -232,11 +235,16 @@ impl Resolver<'_> {
         let mut prefix = PathBuf::new();
         for component in path.components() {
             prefix.push(component);
+            // While walking Windows components, `C:` alone is drive-relative;
+            // wait until the root separator makes it an absolute prefix.
+            if !prefix.is_absolute() {
+                continue;
+            }
             let stat = file_stat::symlink_metadata(&prefix)?;
             if stat.kind == Kind::Symlink {
                 field(&mut self.hash, b"alias");
                 field(&mut self.hash, prefix.as_os_str().as_encoded_bytes());
-                field(&mut self.hash, &stat.mode.to_le_bytes());
+                hash_mode(&mut self.hash, stat.mode);
                 field(
                     &mut self.hash,
                     fs::read_link(&prefix)?.as_os_str().as_encoded_bytes(),
@@ -256,6 +264,11 @@ impl PathPolicy {
     fn new() -> Self {
         let mut forbidden = BTreeSet::new();
         let mut special = BTreeSet::new();
+        // Windows roots come only from MSVC discovery; `validate` still
+        // rejects a whole drive or share.
+        if cfg!(windows) {
+            return Self { forbidden, special };
+        }
         for name in [
             "/",
             "/usr",
@@ -290,7 +303,8 @@ impl PathPolicy {
             path.display()
         );
         ensure!(
-            !self.forbidden.contains(path)
+            path.parent().is_some()
+                && !self.forbidden.contains(path)
                 && !self.special.iter().any(|root| path.starts_with(root)),
             "unsafe runtime root {}; select a specific toolchain or dependency in CORGI_NATIVE_RUNTIME_ROOTS",
             path.display()
@@ -319,12 +333,52 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
+/// Unix permission bits change what a tool can do. Windows attributes do not,
+/// and backup software flips the archive bit, so Windows hashes contents only.
+fn hash_mode(hash: &mut Sha256, mode: u32) {
+    if cfg!(unix) {
+        field(hash, &mode.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 fn uncached(roots: &[PathBuf]) -> Result<RuntimeInputs> {
     resolve_hinted(roots, &mut HintCache::uncached())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::uncached as resolve;
+    use super::*;
+
+    #[test]
+    fn rejects_whole_drives_and_shares() {
+        let policy = PathPolicy::new();
+        for root in [r"C:\", r"\\server\share\"] {
+            assert!(policy.validate(Path::new(root)).is_err());
+        }
+    }
+
+    #[test]
+    fn mutable_contents_and_exact_grants_are_inputs() {
+        let root =
+            std::env::temp_dir().join(format!("corgi-windows-inputs-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("tool.exe");
+        fs::write(&file, b"aaaa").unwrap();
+        let identity = |path: &PathBuf| resolve(std::slice::from_ref(path)).unwrap();
+        let first = identity(&root);
+        assert_eq!(first.identity, identity(&root).identity);
+        fs::write(&file, b"bbbb").unwrap();
+        let rewritten = identity(&root);
+        assert_ne!(first.identity, rewritten.identity);
+        assert_ne!(rewritten.identity, identity(&file).identity);
+        assert!(first.paths.contains(&canonicalize(&root).unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::uncached as resolve;
     use super::*;

@@ -768,7 +768,7 @@ mod tests {
                 header.set_entry_type(entry_type);
                 header.set_mode(mode);
                 header.set_size(0);
-                if path.is_absolute() {
+                if path.has_root() {
                     header.set_path_absolute(path).unwrap();
                 } else if path
                     .components()

@@ -55,6 +55,14 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let argv: Vec<_> = std::env::args_os().collect();
+    #[cfg(windows)]
+    if sandbox::windows::is_helper_invocation(&argv) {
+        std::process::exit(sandbox::windows::run_helper(&argv)? as i32);
+    }
+    #[cfg(windows)]
+    if native_toolchain::is_link_invocation() {
+        std::process::exit(native_toolchain::run_link_invocation(&argv)?);
+    }
     if macos::is_driver_invocation(&argv) {
         return macos::run_driver_invocation(&argv);
     }

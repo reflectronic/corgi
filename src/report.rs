@@ -544,6 +544,8 @@ pub fn append_run(store_root: &Path, report: &Report) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
+        // Windows locks need read or full write access; append-only has neither.
+        .read(true)
         .open(&path)
         .with_context(|| format!("opening run metrics {}", path.display()))?;
     file.lock()

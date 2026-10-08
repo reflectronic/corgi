@@ -22,6 +22,9 @@ pub fn default_root() -> Result<PathBuf> {
     }
     if cfg!(target_os = "macos") {
         Ok(PathBuf::from("/Users/Shared/corgi"))
+    } else if cfg!(windows) {
+        let local = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA not set")?;
+        Ok(PathBuf::from(local).join("corgi"))
     } else {
         Ok(dirs::data_local_dir()
             .context("could not determine the user data directory; set CORGI_STORE")?
@@ -263,6 +266,7 @@ impl Store {
     pub fn new(root: PathBuf) -> Result<Store> {
         for d in [
             "cache",
+            "cargo-home",
             "pool",
             "outdirs",
             "tmp",
@@ -543,6 +547,9 @@ impl Store {
             return Ok(dest);
         }
         let src = self.cache_path(hash);
+        #[cfg(not(unix))]
+        let _ = executable; // Windows executable status is not a permission bit.
+        #[cfg(unix)]
         if executable {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&src)?.permissions();
@@ -658,13 +665,20 @@ impl Store {
             .unwrap()
             .join(format!(".corgi-tmp-{}", std::process::id()));
         fs::copy(self.cache_path(hash), &tmp)?;
+        #[cfg(not(unix))]
+        let _ = executable;
+        #[cfg(unix)]
         if executable {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&tmp)?.permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&tmp, perms)?;
         }
-        fs::rename(&tmp, dest)?;
+        // Windows refuses to replace a running executable, as with Cargo.
+        if let Err(error) = fs::rename(&tmp, dest) {
+            fs::remove_file(&tmp).ok();
+            return Err(error).with_context(|| format!("export {}", dest.display()));
+        }
         self.write_export_hint(&hint_path, dest, hash);
         Ok(())
     }
@@ -690,8 +704,19 @@ impl Store {
             .parent()
             .context("export destination has no parent directory")?;
         fs::create_dir_all(parent)?;
-        let parent_lock =
-            fs::File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+        // Serialize exporters into the same directory. Windows cannot lock a
+        // directory handle, so every platform locks a per-directory store file.
+        let lock_path = self.root.join("locks").join(format!(
+            "export-{}.lock",
+            sha256_hex(parent.display().to_string().as_bytes())
+        ));
+        fs::create_dir_all(lock_path.parent().unwrap())?;
+        let parent_lock = fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
         parent_lock
             .lock()
             .with_context(|| format!("lock {}", parent.display()))?;
@@ -777,20 +802,27 @@ impl Store {
                 for (file_name, blob_hash) in &manifest.objects {
                     let source = self.cache_path(blob_hash);
                     let destination = stage.join(file_name);
-                    // Both names share the CAS inode. Prevent an accidental
-                    // in-place write through the exported name from corrupting it.
-                    let mut permissions = fs::metadata(&source)?.permissions();
-                    permissions.set_readonly(true);
-                    fs::set_permissions(&source, permissions)?;
-                    match fs::hard_link(&source, &destination) {
-                        Ok(()) => {}
-                        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-                            fs::copy(&source, &destination)?;
-                        }
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("materialize debug object {}", destination.display())
-                            });
+                    // Windows hard links share the readonly attribute, which
+                    // blocks deleting target/. Give the worktree its own copy.
+                    #[cfg(not(unix))]
+                    fs::copy(&source, &destination)?;
+                    #[cfg(unix)]
+                    {
+                        // Both names share the CAS inode. Prevent an accidental
+                        // in-place write through the exported name from corrupting it.
+                        let mut permissions = fs::metadata(&source)?.permissions();
+                        permissions.set_readonly(true);
+                        fs::set_permissions(&source, permissions)?;
+                        match fs::hard_link(&source, &destination) {
+                            Ok(()) => {}
+                            Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                                fs::copy(&source, &destination)?;
+                            }
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!("materialize debug object {}", destination.display())
+                                });
+                            }
                         }
                     }
                 }
@@ -1106,7 +1138,9 @@ mod manifest_publication_tests {
         store.save_manifest_entry("key", "old", &entry).unwrap();
         let old_path = store.manifest_path("key", "old");
         let old_bytes = fs::metadata(&old_path).unwrap().len();
-        fs::File::open(&old_path)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&old_path)
             .unwrap()
             .set_modified(SystemTime::UNIX_EPOCH)
             .unwrap();

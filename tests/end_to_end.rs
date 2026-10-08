@@ -4981,7 +4981,11 @@ fn corgi_command() -> Command {
     let curl = std::env::var_os("CORGI_CURL").unwrap_or_else(|| {
         std::env::current_dir()
             .unwrap()
-            .join("tests/support/cached-curl.py")
+            .join(if cfg!(windows) {
+                "tests/support/cached-curl.cmd"
+            } else {
+                "tests/support/cached-curl.py"
+            })
             .into_os_string()
     });
     command.env("CORGI_CURL", curl);
@@ -5143,7 +5147,7 @@ fn debug_map_objects(binary: &Path, workspace: &Path) -> Vec<PathBuf> {
 }
 
 fn report_for_workspace(store: &Path, workspace: &Path) -> serde_json::Value {
-    let canonical_workspace = workspace.canonicalize().unwrap();
+    let canonical_workspace = dunce::canonicalize(workspace).unwrap();
     fs::read_dir(store.join("reports"))
         .unwrap()
         .filter_map(|entry| {
