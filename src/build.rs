@@ -538,8 +538,16 @@ pub struct Ctx {
     report: Arc<crate::report::Recorder>,
 }
 
-/// The C toolchain actions use. Ask it what an action needs rather than
-/// matching on where it came from.
+/// The C toolchain actions use. Corgi gets one in one of these ways:
+/// - supplied: the Clang named by `CORGI_CC`, one compiler for every
+///   platform (`Native`);
+/// - downloaded for macOS: Corgi's pinned Clang, Apple SDK and LLD, set up
+///   per Apple platform (`ManagedDarwin`).
+///
+/// A cross `--target` that needs Zig adds Corgi's pinned Zig on top of
+/// either, for that target only; it is kept separately in `Ctx::zig`.
+///
+/// Ask it what an action needs rather than matching on where it came from.
 enum ResolvedToolchain {
     /// One toolchain selected before planning (`NativeToolchain::select`).
     Native(NativeToolchain),
