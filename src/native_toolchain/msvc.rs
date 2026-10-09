@@ -62,10 +62,41 @@ pub(super) fn discover(host: &str, store: &Store) -> Result<NativeToolchain> {
     for (name, path) in [("CC", &compiler), ("CXX", &compiler), ("AR", &librarian)] {
         environment.insert(name.to_owned(), text(path.as_os_str())?);
     }
+    // bindgen loads libclang while build scripts run. Visual Studio's optional
+    // "C++ Clang tools" component installs one beside MSVC:
+    // ...\VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\cl.exe
+    // ...\VC\Tools\Llvm\<arch>\bin\libclang.dll, headers in lib\clang.
+    let llvm_arch = if arch == "arm64" { "ARM64" } else { arch };
+    if let Some(llvm) = compiler
+        .ancestors()
+        .nth(6)
+        .map(|tools| tools.join("Llvm").join(llvm_arch))
+    {
+        let bin = llvm.join("bin");
+        let libclang = bin.join("libclang.dll");
+        let headers = llvm.join("lib").join("clang");
+        if libclang.is_file() && headers.is_dir() {
+            read_paths.extend([libclang, headers]);
+            environment.insert("LIBCLANG_PATH".into(), text(bin.as_os_str())?);
+        }
+    }
     for name in ["SystemRoot", "LOCALAPPDATA"] {
         let value = std::env::var_os(name).with_context(|| format!("{name} is required"))?;
         environment.insert(name.to_owned(), text(&value)?);
     }
+    // Windows' default system PATH, like /usr/bin:/bin on macOS. The sandbox
+    // already lets every action run these; like macOS's, they are not hashed.
+    let system_root = Path::new(&environment["SystemRoot"]).to_owned();
+    let path = std::env::split_paths(environment.get("PATH").map_or("", String::as_str))
+        .filter(|path| !path.as_os_str().is_empty())
+        .chain([
+            system_root.join("System32"),
+            system_root.clone(),
+            system_root.join(r"System32\Wbem"),
+            system_root.join(r"System32\WindowsPowerShell\v1.0"),
+        ])
+        .collect::<Vec<_>>();
+    environment.insert("PATH".into(), text(&std::env::join_paths(path)?)?);
 
     let inputs = super::inputs::resolve(store, &read_paths)?;
     let identity = crate::store::sha256_hex(&serde_json::to_vec(&(
