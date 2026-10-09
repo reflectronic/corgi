@@ -9220,12 +9220,16 @@ fn compile(
     ];
     check_cfgs.extend(bs.check_cfgs.iter().cloned());
 
+    let link_args = if matches!(unit.kind, Kind::Bin) {
+        bs.link_args.clone()
+    } else {
+        Vec::new()
+    };
     let mut link_search: Vec<String> = bs.link_search.clone();
-    let mut link_args: Vec<String> = Vec::new();
-    if matches!(unit.kind, Kind::Bin) {
-        link_args = bs.link_args.clone();
-        // native lib search paths from all transitive build scripts must be
-        // visible when linking the final binary
+    if unit_links(unit) {
+        // Native lib search paths from all transitive build scripts must be
+        // visible to everything that links: binaries, tests, build scripts,
+        // proc-macros and dylibs alike.
         for i in dependency_closure(ctx, unit.deps.iter().map(|dependency| dependency.unit)) {
             if let Some(r) = results[i].get() {
                 if let Some(b) = &r.res.bs {
