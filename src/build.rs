@@ -5729,15 +5729,28 @@ fn build_inner(
                 written.push(dest);
             }
         }
-        if matches!(u.kind, Kind::Lib) && u.is_root && !u.host {
+        // Without --target every unit is a host unit, so only proc-macros are
+        // host-only there.
+        let built_for_target = if ctx.target.is_some() {
+            !u.host
+        } else {
+            unit_crate_type(u) != "proc-macro"
+        };
+        if matches!(u.kind, Kind::Lib) && u.is_root && built_for_target {
             if let Some(r) = results[i].get() {
                 for o in &r.res.outputs {
                     if o.name.ends_with(".wasm")
                         || o.name.ends_with(".dylib")
                         || o.name.ends_with(".so")
+                        || o.name.ends_with(".dll")
                     {
                         let dest = ctx.export_binary(i, o, &r.res)?;
                         written.push(dest);
+                    } else if o.name.ends_with(".dll.lib") {
+                        // Native code links against a DLL through its import library.
+                        let relative = binary_export_path(&ctx, i, &o.name);
+                        let dest = ctx.target_dir.join(relative.strip_prefix("target")?);
+                        ctx.store.export(&o.hash, &dest, false)?;
                     }
                 }
             }

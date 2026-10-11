@@ -860,6 +860,52 @@ fn ordinary_build_compiles_and_exports_a_wasm_library() {
 }
 
 #[test]
+fn ordinary_build_exports_a_native_dynamic_library() {
+    let directory = TestDirectory::new("native-cdylib");
+    let workspace = directory.path.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::copy(
+        std::env::current_dir().unwrap().join("rust-toolchain.toml"),
+        workspace.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::write(workspace.join("corgi.toml"), "").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [lib]\ncrate-type = [\"cdylib\"]\n",
+            directory.package_name
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "#[unsafe(no_mangle)]\npub extern \"C\" fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    let output = invoke_corgi(&workspace, "build", []);
+
+    assert_success(&output, "build native dynamic library");
+    let library = workspace.join("target/debug").join(format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        directory.package_name.replace('-', "_"),
+        std::env::consts::DLL_SUFFIX
+    ));
+    assert!(library.is_file(), "missing {}", library.display());
+    if cfg!(windows) {
+        let import_library = library.with_extension("dll.lib");
+        assert!(
+            import_library.is_file(),
+            "missing {}",
+            import_library.display()
+        );
+    }
+}
+
+#[test]
 fn build_std_compiles_and_exports_a_wasm_library() {
     let directory = TestDirectory::new("build-std");
     let workspace = directory.path.join("workspace");
