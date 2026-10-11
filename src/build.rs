@@ -2603,14 +2603,38 @@ fn record_target_without_harness(
     Ok(())
 }
 
-/// Bare-name spawns (`Command::new("cmake")`) resolve through a shim dir
-/// of symlinks to exactly the tools visible to this action. One dir per
-/// distinct subset, named by the subset's identity hash; contents derive
-/// from keyed tool ids, so PATH itself never needs keying.
-fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>> {
-    let with_bin: Vec<&&ToolRt> = tools.iter().filter(|t| !t.bin.is_empty()).collect();
+/// The directories bare-name spawns (`Command::new("cmake")`) search first
+/// for the tools visible to this action. They derive from keyed tool ids, so
+/// PATH itself never needs keying.
+///
+/// Unix gets one shim dir of symlinks to exactly those tools, per distinct
+/// subset, named by the subset's identity hash. A Windows program finds its
+/// DLLs beside the path it was started from, so it can't run through a
+/// link: Windows gets each tool's own directory, whose contents are pinned
+/// with the tool.
+fn tool_path_entries(store: &Store, tools: &[&ToolRt]) -> Result<Vec<PathBuf>> {
+    let mut with_bin: Vec<&&ToolRt> = tools.iter().filter(|t| !t.bin.is_empty()).collect();
     if with_bin.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
+    }
+    let program = |t: &ToolRt| {
+        store
+            .root
+            .join("tools")
+            .join(format!("{}-{}", t.name, t.version))
+            .join(&t.bin)
+    };
+    if cfg!(windows) {
+        with_bin.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut directories = Vec::new();
+        for t in with_bin {
+            let program = program(t);
+            let directory = program.parent().context("tool program has no directory")?;
+            if !directories.iter().any(|known| known == directory) {
+                directories.push(directory.to_owned());
+            }
+        }
+        return Ok(directories);
     }
     let mut ids: Vec<&str> = with_bin.iter().map(|t| t.id.as_str()).collect();
     ids.sort();
@@ -2618,17 +2642,13 @@ fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>
     let dir = store.root.join("toolsets").join(&subset[..16]);
     if dir.exists() {
         Store::touch_used(&dir);
-        return Ok(Some(dir));
+        return Ok(vec![dir]);
     }
     let tmp = store.tmp_path("shims");
     fs::create_dir_all(&tmp)?;
     for t in &with_bin {
-        let target = store
-            .root
-            .join("tools")
-            .join(format!("{}-{}", t.name, t.version))
-            .join(&t.bin);
-        crate::platform::symlink(&target, tmp.join(&t.name)).ok();
+        crate::platform::symlink(program(t), tmp.join(&t.name))
+            .with_context(|| format!("linking tool {}", t.name))?;
     }
     fs::create_dir_all(dir.parent().unwrap())?;
     match fs::rename(&tmp, &dir) {
@@ -2638,7 +2658,7 @@ fn ensure_tool_shims(store: &Store, tools: &[&ToolRt]) -> Result<Option<PathBuf>
         }
         Err(e) => return Err(e).context("publishing tool shims"),
     }
-    Ok(Some(dir))
+    Ok(vec![dir])
 }
 
 /// Fetch + verify + unpack a pinned tool into the store (atomic, lock-free).
@@ -9957,15 +9977,20 @@ fn run_build_script(
     for (k, v) in &spec.environment {
         cmd.env(k, v);
     }
-    if let Some(shims) = ensure_tool_shims(&ctx.store, &visible_tools)? {
-        let path = spec
+    let mut path = tool_path_entries(&ctx.store, &visible_tools)?;
+    if !path.is_empty() {
+        let inherited = spec
             .environment
             .iter()
             .rev()
             .find(|(name, _)| name == "PATH")
-            .map(|(_, value)| value.as_str())
-            .unwrap_or("/usr/bin:/bin");
-        cmd.env("PATH", format!("{}:{path}", shims.display()));
+            .map(|(_, value)| value.as_str());
+        match inherited {
+            Some(value) => path.extend(std::env::split_paths(value)),
+            None if cfg!(unix) => path.extend(["/usr/bin".into(), "/bin".into()]),
+            None => {}
+        }
+        cmd.env("PATH", std::env::join_paths(path)?);
     }
     for (k, v) in &dep_env {
         cmd.env(k, v);
