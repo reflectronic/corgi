@@ -555,9 +555,9 @@ fn fetch_populates_the_shared_cargo_home_without_building() {
     fs::write(
         workspace.join("Cargo.toml"),
         format!(
-            "{}\n[dependencies]\nfetched-dependency = {{ git = \"file://{}\" }}\n",
+            "{}\n[dependencies]\nfetched-dependency = {{ git = \"{}\" }}\n",
             fs::read_to_string(workspace.join("Cargo.toml")).unwrap(),
-            dependency.display()
+            file_url(&dependency)
         ),
     )
     .unwrap();
@@ -624,6 +624,7 @@ fn fetch_prepares_a_cold_store_for_an_offline_build() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "Windows builds support only the host target")]
 fn fetch_prepares_standard_library_sources_for_an_offline_build_std_check() {
     let directory = TestDirectory::new("offline-build-std");
     let workspace = directory.path.join("workspace");
@@ -814,6 +815,7 @@ fn workspace_member_uses_its_selected_project_config() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "Windows builds support only the host target")]
 fn ordinary_build_compiles_and_exports_a_wasm_library() {
     let directory = TestDirectory::new("ordinary-wasm");
     let workspace = directory.path.join("workspace");
@@ -950,13 +952,7 @@ fn build_scripts_start_tools_by_bare_name_beside_their_dlls() {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let url = format!(
-        "file:///{}",
-        dunce::simplified(&archive_path)
-            .to_str()
-            .unwrap()
-            .replace('\\', "/")
-    );
+    let url = file_url(&archive_path);
 
     fs::copy(
         std::env::current_dir().unwrap().join("rust-toolchain.toml"),
@@ -1012,6 +1008,7 @@ fn build_scripts_start_tools_by_bare_name_beside_their_dlls() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "Windows builds support only the host target")]
 fn build_std_compiles_and_exports_a_wasm_library() {
     let directory = TestDirectory::new("build-std");
     let workspace = directory.path.join("workspace");
@@ -2596,10 +2593,10 @@ fn clean_expires_incremental_state_before_other_cached_data() {
     fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     fs::write(&artifact, b"artifact").unwrap();
     fs::write(&expired_artifact, b"expired").unwrap();
-    fs::File::open(&expired_artifact)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
-        .unwrap();
+    set_modified(
+        &expired_artifact,
+        SystemTime::now() - Duration::from_secs(7 * 24 * 3600),
+    );
     fs::create_dir_all(report.parent().unwrap()).unwrap();
     fs::write(&report, b"report").unwrap();
     fs::create_dir_all(old_manifest.parent().unwrap()).unwrap();
@@ -2608,15 +2605,9 @@ fn clean_expires_incremental_state_before_other_cached_data() {
 
     let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
     for path in [&old_incremental, &artifact, &report] {
-        fs::File::open(path)
-            .unwrap()
-            .set_modified(two_days_ago)
-            .unwrap();
+        set_modified(path, two_days_ago);
     }
-    fs::File::open(&old_manifest)
-        .unwrap()
-        .set_modified(two_days_ago)
-        .unwrap();
+    set_modified(&old_manifest, two_days_ago);
 
     let output = corgi_command()
         .arg("clean")
@@ -2662,10 +2653,7 @@ fn clean_pool_retires_metadata_with_its_library_without_removing_shared_metadata
         let unpaired_library = pool.join("libunpaired-compiler-old.rlib");
         fs::write(&unpaired_library, b"library without separate metadata").unwrap();
         for path in [&old_library, &unpaired_library] {
-            fs::File::open(path)
-                .unwrap()
-                .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
-                .unwrap();
+            set_modified(path, SystemTime::now() - Duration::from_secs(7 * 24 * 3600));
         }
 
         let output = corgi_command()
@@ -2703,10 +2691,10 @@ fn clean_pool_preserves_the_library_when_paired_metadata_cannot_be_removed() {
     let metadata = pool.join("libdemo-compiler-old.rmeta");
     fs::create_dir_all(&metadata).unwrap();
     fs::write(&library, b"library").unwrap();
-    fs::File::open(&library)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 3600))
-        .unwrap();
+    set_modified(
+        &library,
+        SystemTime::now() - Duration::from_secs(7 * 24 * 3600),
+    );
 
     let output = corgi_command()
         .arg("clean")
@@ -2754,16 +2742,10 @@ fn clean_custom_age_uses_one_cutoff_except_for_orphaned_staging() {
                     fs::write(&path, b"cached").unwrap();
                     path.clone()
                 };
-                fs::File::open(&marker)
-                    .unwrap()
-                    .set_modified(now - age)
-                    .unwrap();
+                set_modified(&marker, now - age);
                 // OUT_DIR retention must use its sentinel, not its recent directory mtime.
                 if namespace != "outdirs" {
-                    fs::File::open(&path)
-                        .unwrap()
-                        .set_modified(now - age)
-                        .unwrap();
+                    set_modified(&path, now - age);
                 }
             }
         }
@@ -2807,10 +2789,10 @@ fn clean_invalid_age_leaves_store_untouched() {
     let artifact = store.join("cache/aa/artifact");
     fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     fs::write(&artifact, b"artifact").unwrap();
-    fs::File::open(&artifact)
-        .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(10 * 24 * 3600))
-        .unwrap();
+    set_modified(
+        &artifact,
+        SystemTime::now() - Duration::from_secs(10 * 24 * 3600),
+    );
 
     for duration in ["24", "18446744073709551615d", "18446744073709551615s"] {
         let output = corgi_command()
@@ -5217,6 +5199,31 @@ fn invoke_corgi_test(fixture: &Path, marker: Option<&Path>) -> Output {
         command.env("CORGI_TEST_MARKER", marker);
     }
     command.output().expect("failed to invoke corgi")
+}
+
+/// A `file://` URL for an absolute path: `file:///tmp/x` or `file:///C:/x`.
+fn file_url(path: &Path) -> String {
+    let path = dunce::simplified(path).to_str().unwrap().replace('\\', "/");
+    format!("file:///{}", path.trim_start_matches('/'))
+}
+
+/// Set a file's or directory's modification time. Windows checks the access
+/// a handle was opened with, so `File::open`'s read-only handle can't do it,
+/// and opens directories only with backup semantics.
+fn set_modified(path: &Path, time: SystemTime) {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    #[cfg(not(windows))]
+    let file = fs::File::open(path);
+    file.unwrap().set_modified(time).unwrap();
 }
 
 fn fixture_path(name: &str) -> PathBuf {
