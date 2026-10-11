@@ -906,7 +906,8 @@ fn ordinary_build_exports_a_native_dynamic_library() {
 }
 
 /// A Windows program finds its DLLs beside itself, so a tool must run from
-/// its own directory even when a build script starts it by bare name.
+/// its own directory even when a build script starts it by bare name, under
+/// either its `[tools]` name or its program's file name.
 #[cfg(windows)]
 #[test]
 fn build_scripts_start_tools_by_bare_name_beside_their_dlls() {
@@ -965,7 +966,7 @@ fn build_scripts_start_tools_by_bare_name_beside_their_dlls() {
     fs::write(
         workspace.join("corgi.toml"),
         format!(
-            "[tools.greet]\nversion = \"1\"\nurl = \"{url}\"\nsha256 = \"{sha256}\"\n\
+            "[tools.greeter]\nversion = \"1\"\nurl = \"{url}\"\nsha256 = \"{sha256}\"\n\
              bin = \"bin/greet.exe\"\nenv = \"GREET\"\n"
         ),
     )
@@ -981,10 +982,12 @@ fn build_scripts_start_tools_by_bare_name_beside_their_dlls() {
     fs::write(
         workspace.join("build.rs"),
         "fn main() {\n\
-         let output = std::process::Command::new(\"greet\").output().unwrap();\n\
-         assert!(output.status.success(), \"greet failed: {output:?}\");\n\
-         let greeting = String::from_utf8(output.stdout).unwrap();\n\
-         println!(\"cargo::rustc-env=GREETING={}\", greeting.trim());\n\
+         let greetings = [\"greeter\", \"greet\"].map(|name| {\n\
+             let output = std::process::Command::new(name).output().unwrap();\n\
+             assert!(output.status.success(), \"{name} failed: {output:?}\");\n\
+             String::from_utf8(output.stdout).unwrap().trim().to_owned()\n\
+         });\n\
+         println!(\"cargo::rustc-env=GREETING={}\", greetings.join(\" / \"));\n\
          }\n",
     )
     .unwrap();
@@ -994,14 +997,18 @@ fn build_scripts_start_tools_by_bare_name_beside_their_dlls() {
     )
     .unwrap();
 
-    let output = invoke_corgi(&workspace, "build", []);
+    // A shared store would keep a tool installed by an earlier run.
+    let output = invoke_corgi_with_store(&workspace, "build", [], &directory.path.join("store"));
     assert_success(&output, "build with a tool started by bare name");
     let binary = workspace
         .join("target/debug")
         .join(format!("{}.exe", directory.package_name));
     let output = Command::new(&binary).output().unwrap();
     assert_success(&output, "run the built program");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "greet 7");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "greet 7 / greet 7"
+    );
 }
 
 #[test]

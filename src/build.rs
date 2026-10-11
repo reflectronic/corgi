@@ -2610,8 +2610,8 @@ fn record_target_without_harness(
 /// Unix gets one shim dir of symlinks to exactly those tools, per distinct
 /// subset, named by the subset's identity hash. A Windows program finds its
 /// DLLs beside the path it was started from, so it can't run through a
-/// link: Windows gets each tool's own directory, whose contents are pinned
-/// with the tool.
+/// link in another directory: Windows gets each tool's own directory, whose
+/// contents are pinned with the tool (plus the link from `tool_alias`).
 fn tool_path_entries(store: &Store, tools: &[&ToolRt]) -> Result<Vec<PathBuf>> {
     let mut with_bin: Vec<&&ToolRt> = tools.iter().filter(|t| !t.bin.is_empty()).collect();
     if with_bin.is_empty() {
@@ -2669,6 +2669,8 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
         .join("tools")
         .join(format!("{}-{}", t.name, t.version));
     if dest.join(exported).exists() {
+        // Tools installed before Windows aliases existed gain one here.
+        link_tool_alias(&dest, t)?;
         touch_tool_marker(&dest);
         return Ok(dest.join(exported));
     }
@@ -2766,6 +2768,14 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     if !unpack.join(exported).exists() {
         bail!("tool {}: `{exported}` not found inside the archive", t.name);
     }
+    if let Some(alias) = tool_alias(&unpack, t).filter(|alias| alias.exists()) {
+        bail!(
+            "tool {}: the archive already has a different program named {}",
+            t.name,
+            alias.display()
+        );
+    }
+    link_tool_alias(&unpack, t)?;
     fs::create_dir_all(dest.parent().unwrap())?;
     match fs::rename(&unpack, &dest) {
         Ok(()) => {}
@@ -2775,6 +2785,33 @@ fn ensure_tool(store: &Store, t: &ToolSpec) -> Result<PathBuf> {
     touch_tool_marker(&dest);
     fs::remove_dir_all(&work).ok();
     Ok(dest.join(exported))
+}
+
+/// Windows build scripts find a tool through its directory on PATH (see
+/// `tool_path_entries`), which names it by its file. When the program is
+/// named differently from the tool, a hard link beside it adds the tool's
+/// name; beside the program, the link still finds the program's DLLs.
+fn tool_alias(directory: &Path, t: &ToolSpec) -> Option<PathBuf> {
+    if !cfg!(windows) || t.bin.is_empty() {
+        return None;
+    }
+    let program = directory.join(&t.bin);
+    let name = executable_name(&t.name);
+    let named = program
+        .file_name()
+        .is_some_and(|file| file.eq_ignore_ascii_case(&name));
+    (!named).then(|| program.with_file_name(name))
+}
+
+fn link_tool_alias(directory: &Path, t: &ToolSpec) -> Result<()> {
+    let Some(alias) = tool_alias(directory, t) else {
+        return Ok(());
+    };
+    match fs::hard_link(directory.join(&t.bin), &alias) {
+        Ok(()) => Ok(()),
+        Err(_) if alias.exists() => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("linking {}", alias.display())),
+    }
 }
 
 /// Provision a pinned macOS artifact, keying its store directory on the source
